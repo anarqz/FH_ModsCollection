@@ -1,0 +1,10 @@
+LIBRARY KERNEL32.dll
+EXPORTS
+    CreateToolhelp32Snapshot
+    Thread32First
+    Thread32Next
+    OpenThread
+    SuspendThread
+    ResumeThread
+    GetThreadContext
+    SetThreadContext

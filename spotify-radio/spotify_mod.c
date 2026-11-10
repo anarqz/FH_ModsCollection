@@ -16,12 +16,17 @@
 #define LINE_IN_VERSION "dev"
 #endif
 
+#ifndef INFINITY_EO // Infinity: an ExtraOptions plugin (infinity/eo_plugin.c), never an Azimuth Mod Loader mod
 AZIMUTH_MOD_GAMES(AZIMUTH_GAME_FORZA_HORIZON_2 | AZIMUTH_GAME_FORZA_HORIZON_3);
+#endif
 // The game is told apart by the code at its hook sites (spotify_bridge_detect_game), not host->game:
 // a host->game check made one antivirus ML engine flag the DLL.
 
 static wchar_t path[PATH_CAPACITY];
 
+// Infinity: the logo ships in the mod's ExtraOptions media folder, and nothing is written outside the
+// mod's own folder (no logo copy into the game's Mount folder, no move of another install's files).
+#ifndef INFINITY_EO
 static int same_ignore_case(const wchar_t *a, const wchar_t *b) {
     for (;; ++a, ++b) {
         wchar_t x = *a >= L'A' && *a <= L'Z' ? *a + 32 : *a, y = *b >= L'A' && *b <= L'Z' ? *b + 32 : *b;
@@ -90,6 +95,7 @@ static int install_logo(const AzimuthModHost *host, int fh3) {
     }
     return 1;
 }
+#endif
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
     (void)instance;
@@ -100,6 +106,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
     return TRUE;
 }
 
+#ifndef INFINITY_EO
 /* This mod was FH2_<name>: an older install's config file, login and songs move to its folder now,
    with the FH2_ gone from their names. What the zip just brought (librespot.exe) stays the new one. */
 static void move_old_data(const AzimuthModHost *host) {
@@ -128,14 +135,21 @@ static void move_old_data(const AzimuthModHost *host) {
     FindClose(find);
     RemoveDirectoryW(old); // fails harmlessly while something is left in it
 }
+#endif
 
+#ifdef INFINITY_EO
+int spotify_radio_load(const AzimuthModHost *host) { // called by infinity/eo_plugin.c (FH2PluginInitialize)
+#else
 __declspec(dllexport) int AzimuthModLoad(const AzimuthModHost *host) {
+#endif
     if (!host || host->size < sizeof(*host) || host->api_version != AZIMUTH_MOD_API_VERSION || !host->game_image) {
         return 0;
     }
     int fh3 = spotify_bridge_detect_game(host->game_image);
     CreateDirectoryW(host->data_dir, NULL); // fails harmlessly if it exists
+#ifndef INFINITY_EO
     move_old_data(host);
+#endif
     static wchar_t previous[PATH_CAPACITY]; // keep last session's log: problems get reported after a restart
     if (path_join(path, host->data_dir, RADIO_WIDE(RADIO_FILE) L".log") &&
         path_join(previous, host->data_dir, RADIO_WIDE(RADIO_FILE) L".previous.log")) {
@@ -145,8 +159,11 @@ __declspec(dllexport) int AzimuthModLoad(const AzimuthModHost *host) {
     }
     // Both radios hook the same station: a second hook on the same code would crash the game.
     static const wchar_t *const rivals[] = {
-#ifdef LINE_IN_RADIO
+#if defined(LINE_IN_RADIO) || defined(INFINITY_EO)
         L"FH_SpotifyRadio.dll",
+#endif
+#ifdef INFINITY_EO // the original radios under the Azimuth Mod Loader (<Azimuth>\mods\*.dll)
+        L"FH_LineInRadio.dll",
 #endif
         L"FH2_SpotifyRadio.dll", L"FH2_LineInRadio.dll"};
     for (unsigned i = 0; i < ARRAY_COUNT(rivals); ++i) {
@@ -159,9 +176,11 @@ __declspec(dllexport) int AzimuthModLoad(const AzimuthModHost *host) {
 #ifdef LINE_IN_RADIO
     line_in_menu_install(host->game_image, fh3);
 #endif
+#ifndef INFINITY_EO
     if (install_logo(host, fh3)) {
         spotify_bridge_mount_logo_folder(host->game_image);
     }
+#endif
     track_controls_load(host->data_dir);
     spotify_bridge_install_controls(host->game_image);
     spotify_bridge_start(host->data_dir);

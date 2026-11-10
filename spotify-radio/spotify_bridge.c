@@ -4,6 +4,9 @@
 #include "support.h"
 #include "pinyin_table.h"
 #include "unidecode_table.h"
+#ifdef INFINITY_EO
+#include "infinity_eo.h"
+#endif
 
 typedef int (*FmodPlaySoundFn)(void *system, void *sound, void *channelgroup, int paused, void **channel);
 typedef int (*FmodSystemUpdateFn)(void *system);
@@ -599,7 +602,14 @@ void *install_jmp_hook(unsigned char *target, size_t copy_len, void *hook) {
     }
     FlushInstructionCache(GetCurrentProcess(), trampoline, 64);
 
+#ifdef INFINITY_EO
+    // ExtraOptions starts plugins while the game runs: no other thread may run these bytes mid-write
+    infinity_freeze_threads(target, copy_len, trampoline);
+#endif
     if (!VirtualProtect(target, copy_len, PAGE_EXECUTE_READWRITE, &old_protect)) {
+#ifdef INFINITY_EO
+        infinity_thaw_threads();
+#endif
         VirtualFree(trampoline, 0, MEM_RELEASE);
         return NULL;
     }
@@ -611,6 +621,9 @@ void *install_jmp_hook(unsigned char *target, size_t copy_len, void *hook) {
     }
     VirtualProtect(target, copy_len, old_protect, &old_protect);
     FlushInstructionCache(GetCurrentProcess(), target, copy_len);
+#ifdef INFINITY_EO
+    infinity_thaw_threads();
+#endif
     return trampoline;
 }
 
