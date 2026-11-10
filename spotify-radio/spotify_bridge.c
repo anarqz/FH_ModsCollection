@@ -585,6 +585,53 @@ static int xbox_stream_read_hook(void *sound, void *data, unsigned int datalen) 
 // 14-byte absolute jmp at target; copy_len (>= 14) whole, non-RIP-relative prologue bytes
 // run from the returned trampoline. Returns NULL on failure. The trampoline is written, then made
 // read+execute: no memory is ever writable and executable at once (what antivirus heuristics flag).
+#ifdef INFINITY_EO
+/* Infinity: ExtraOptions starts plugins while the game runs, so a hook can be entered the instant its jmp
+   exists. The trampoline is stored in *original before the jmp is written (a hook that chains never calls
+   a NULL original), the target is made writable before any thread is suspended (a failure leaves no
+   thread redirected into a freed trampoline), and the jmp is written with every other thread suspended
+   (infinity_freeze_threads: none runs half-written bytes). */
+static void *install_jmp_hook_into(void **original, unsigned char *target, size_t copy_len, void *hook) {
+    unsigned char *trampoline = (unsigned char *)VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!trampoline) {
+        return NULL;
+    }
+    static const unsigned char jmp_rip[6] = {0xff, 0x25, 0x00, 0x00, 0x00, 0x00}; // jmp qword ptr [rip + 0]
+    memory_copy(trampoline, target, copy_len);
+    memory_copy(trampoline + copy_len, jmp_rip, sizeof(jmp_rip));
+    uintptr_t return_address = (uintptr_t)(target + copy_len);
+    memory_copy(trampoline + copy_len + 6, &return_address, sizeof(return_address));
+    DWORD trampoline_protect, target_protect;
+    if (!VirtualProtect(trampoline, 64, PAGE_EXECUTE_READ, &trampoline_protect)) {
+        VirtualFree(trampoline, 0, MEM_RELEASE);
+        return NULL;
+    }
+    FlushInstructionCache(GetCurrentProcess(), trampoline, 64);
+    if (!VirtualProtect(target, copy_len, PAGE_EXECUTE_READWRITE, &target_protect)) {
+        VirtualFree(trampoline, 0, MEM_RELEASE);
+        return NULL;
+    }
+    __atomic_store_n(original, (void *)trampoline, __ATOMIC_RELEASE);
+    infinity_freeze_threads(target, copy_len, trampoline);
+    memory_copy(target, jmp_rip, sizeof(jmp_rip));
+    uintptr_t hook_address = (uintptr_t)hook;
+    memory_copy(target + 6, &hook_address, sizeof(hook_address));
+    for (size_t i = 14; i < copy_len; ++i) {
+        target[i] = 0x90;
+    }
+    FlushInstructionCache(GetCurrentProcess(), target, copy_len);
+    infinity_thaw_threads();
+    VirtualProtect(target, copy_len, target_protect, &target_protect);
+    return trampoline;
+}
+
+void *install_jmp_hook(unsigned char *target, size_t copy_len, void *hook) {
+    static void *unused; // hooks that replace their function and never call it back
+    return install_jmp_hook_into(&unused, target, copy_len, hook);
+}
+#define HOOK_INTO(original, target, copy_len, hook) \
+    ((void)install_jmp_hook_into((void **)&(original), (target), (copy_len), (void *)(hook)))
+#else
 void *install_jmp_hook(unsigned char *target, size_t copy_len, void *hook) {
     unsigned char *trampoline = (unsigned char *)VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!trampoline) {
@@ -602,14 +649,7 @@ void *install_jmp_hook(unsigned char *target, size_t copy_len, void *hook) {
     }
     FlushInstructionCache(GetCurrentProcess(), trampoline, 64);
 
-#ifdef INFINITY_EO
-    // ExtraOptions starts plugins while the game runs: no other thread may run these bytes mid-write
-    infinity_freeze_threads(target, copy_len, trampoline);
-#endif
     if (!VirtualProtect(target, copy_len, PAGE_EXECUTE_READWRITE, &old_protect)) {
-#ifdef INFINITY_EO
-        infinity_thaw_threads();
-#endif
         VirtualFree(trampoline, 0, MEM_RELEASE);
         return NULL;
     }
@@ -621,11 +661,11 @@ void *install_jmp_hook(unsigned char *target, size_t copy_len, void *hook) {
     }
     VirtualProtect(target, copy_len, old_protect, &old_protect);
     FlushInstructionCache(GetCurrentProcess(), target, copy_len);
-#ifdef INFINITY_EO
-    infinity_thaw_threads();
-#endif
     return trampoline;
 }
+#define HOOK_INTO(original, target, copy_len, hook) \
+    ((original) = (__typeof__(original))install_jmp_hook((target), (copy_len), (void *)(hook)))
+#endif
 
 static wchar_t s_work_dir[PATH_CAPACITY];
 // The HUD hook (game thread) reads the shown buffer every frame while the poll fills the other one and
@@ -1197,7 +1237,7 @@ void spotify_bridge_mount_logo_folder(unsigned char *game_image) {
     g_folder_vtable[1 + 0xe8 / 8] = (void *)folder_file_exists_hook;
     unsigned char *resolve = game_image + RADIO_RVA(0x11f49b0, 0x1c54da0);
     if (memory_equal(resolve, prologue, sizeof(resolve_prologue))) {
-        g_orig_resolve = (ResolveFileFn)install_jmp_hook(resolve, sizeof(resolve_prologue), (void *)&resolve_file_hook);
+        HOOK_INTO(g_orig_resolve, resolve, sizeof(resolve_prologue), (void *)&resolve_file_hook);
     }
     log_append(g_orig_resolve ? "SPOTIFY: logo installed; its folder is mounted on the game's first file lookup.\r\n"
                               : "SPOTIFY: file lookup hook skipped (unexpected code); Xbox Music keeps its logo.\r\n");
@@ -1245,16 +1285,16 @@ void spotify_bridge_apply_audio_hook(unsigned char *game_image) {
     static const unsigned char fh3_lock_prologue[15] = {0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x74,
                                                         0x24, 0x18, 0x57, 0x48, 0x83, 0xec, 0x20};
     if (ok && g_fh3 && memory_equal(game_image + 0x1071390, fh3_lock_prologue, sizeof(fh3_lock_prologue))) {
-        g_orig_station_locked = install_jmp_hook(game_image + 0x1071390, sizeof(fh3_lock_prologue), (void *)&station_locked_hook);
+        HOOK_INTO(g_orig_station_locked, game_image + 0x1071390, sizeof(fh3_lock_prologue), (void *)&station_locked_hook);
     }
     if (ok && !g_fh3 && memory_equal(game_image + 0xa65df0, lock_prologue, sizeof(lock_prologue))) {
-        g_orig_station_locked = install_jmp_hook(game_image + 0xa65df0, sizeof(lock_prologue), (void *)&station_locked_hook);
+        HOOK_INTO(g_orig_station_locked, game_image + 0xa65df0, sizeof(lock_prologue), (void *)&station_locked_hook);
     }
     // RadioSystem's Xbox Music command: mov [rsp+18h],rbx / push rsi / sub rsp,30h / cmp byte [rcx],0 / mov ebx,edx
     static const unsigned char command_prologue[15] = {0x48, 0x89, 0x5c, 0x24, 0x18, 0x56, 0x48, 0x83,
                                                        0xec, 0x30, 0x80, 0x39, 0x00, 0x8b, 0xda};
     if (ok && memory_equal(game_image + RADIO_RVA(0x1018420, FH3_XBOX_COMMAND), command_prologue, sizeof(command_prologue))) {
-        g_orig_xbox_command = install_jmp_hook(game_image + RADIO_RVA(0x1018420, FH3_XBOX_COMMAND), sizeof(command_prologue), (void *)&xbox_command_hook);
+        HOOK_INTO(g_orig_xbox_command, game_image + RADIO_RVA(0x1018420, FH3_XBOX_COMMAND), sizeof(command_prologue), (void *)&xbox_command_hook);
     }
     // HudStatusRadioManager::OnSystemEvent: mov [rsp+10h],rsi / push rdi / sub rsp,30h / mov rsi,r9 / mov rdi,rcx
     static const unsigned char hud_prologue[16] = {0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83,
@@ -1263,13 +1303,13 @@ void spotify_bridge_apply_audio_hook(unsigned char *game_image) {
     static const unsigned char fh3_hud_prologue[15] = {0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c,
                                                        0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18};
     if (ok && g_fh3 && memory_equal(game_image + 0xb25690, fh3_hud_prologue, sizeof(fh3_hud_prologue))) {
-        g_orig_hud_radio_event = install_jmp_hook(game_image + 0xb25690, sizeof(fh3_hud_prologue), (void *)&hud_radio_event_hook_fh3);
+        HOOK_INTO(g_orig_hud_radio_event, game_image + 0xb25690, sizeof(fh3_hud_prologue), (void *)&hud_radio_event_hook_fh3);
     }
     // Forza Horizon 3: mov rax,rsp / push rbp / push rdi / sub rsp,48h / cmp byte [rcx+58h],0 / mov rbp,rdx
     static const unsigned char fh3_filter_prologue[16] = {0x48, 0x8b, 0xc4, 0x55, 0x57, 0x48, 0x83, 0xec,
                                                           0x48, 0x80, 0x79, 0x58, 0x00, 0x48, 0x8b, 0xea};
     if (ok && g_fh3 && memory_equal(game_image + 0x8ac910, fh3_filter_prologue, sizeof(fh3_filter_prologue))) {
-        g_orig_station_hidden = install_jmp_hook(game_image + 0x8ac910, sizeof(fh3_filter_prologue), (void *)&station_hidden_hook_fh3);
+        HOOK_INTO(g_orig_station_hidden, game_image + 0x8ac910, sizeof(fh3_filter_prologue), (void *)&station_hidden_hook_fh3);
     }
     if (g_fh3) {
         log_append(g_orig_station_hidden ? "SPOTIFY: Xbox Music station in the radio cycle.\r\n"
@@ -1279,20 +1319,20 @@ void spotify_bridge_apply_audio_hook(unsigned char *game_image) {
     static const unsigned char fh3_load_page_prologue[19] = {0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x56, 0x48, 0x8d, 0x6c,
                                                              0x24, 0x90, 0x48, 0x81, 0xec, 0x70, 0x01, 0x00, 0x00};
     if (ok && g_fh3 && memory_equal(game_image + 0x21dd6c0, fh3_load_page_prologue, sizeof(fh3_load_page_prologue))) {
-        g_orig_load_page = install_jmp_hook(game_image + 0x21dd6c0, sizeof(fh3_load_page_prologue), (void *)&load_page_hook);
+        HOOK_INTO(g_orig_load_page, game_image + 0x21dd6c0, sizeof(fh3_load_page_prologue), (void *)&load_page_hook);
     }
     if (g_fh3 && !g_orig_load_page) {
         log_append("SPOTIFY: audio options page hook skipped (unexpected code); the Groove Music Shuffle row stays.\r\n");
     }
 #endif
     if (ok && !g_fh3 && memory_equal(game_image + 0x7835b0, hud_prologue, sizeof(hud_prologue))) {
-        g_orig_hud_radio_event = install_jmp_hook(game_image + 0x7835b0, sizeof(hud_prologue), (void *)&hud_radio_event_hook);
+        HOOK_INTO(g_orig_hud_radio_event, game_image + 0x7835b0, sizeof(hud_prologue), (void *)&hud_radio_event_hook);
     }
     // IsXboxMusicEnabled getter: mov [rsp+8],rcx / push rdi / sub rsp,40h / mov qword [rsp+30h],-2
     static const unsigned char option_prologue[19] = {0x48, 0x89, 0x4c, 0x24, 0x08, 0x57, 0x48, 0x83, 0xec, 0x40,
                                                       0x48, 0xc7, 0x44, 0x24, 0x30, 0xfe, 0xff, 0xff, 0xff};
     if (ok && !g_fh3 && memory_equal(game_image + 0xc72eb0, option_prologue, sizeof(option_prologue))) {
-        g_orig_xbox_option_visible = install_jmp_hook(game_image + 0xc72eb0, sizeof(option_prologue), (void *)&xbox_option_visible_hook);
+        HOOK_INTO(g_orig_xbox_option_visible, game_image + 0xc72eb0, sizeof(option_prologue), (void *)&xbox_option_visible_hook);
     }
     // AudioSnapshotManagerFmod's copy: mov [rsp+8],rbx / push rdi / sub rsp,20h / mov rbx,[rcx+48h] / mov rdi,rcx
     static const unsigned char snapshot_prologue[17] = {0x48, 0x89, 0x5c, 0x24, 0x08, 0x57, 0x48, 0x83, 0xec,
@@ -1324,7 +1364,7 @@ void spotify_bridge_apply_audio_hook(unsigned char *game_image) {
                                                           0x48, 0xc7, 0x44, 0x24, 0x40, 0xfe, 0xff, 0xff, 0xff};
     unsigned char *update_target = game_image + RADIO_RVA(0x199d510, 0x27c0900);
     if (memory_equal(update_target, g_fh3 ? fh3_update_prologue : update_prologue, sizeof(update_prologue))) {
-        g_orig_update = (FmodSystemUpdateFn)install_jmp_hook(update_target, sizeof(update_prologue), (void *)&fmod_update_hook);
+        HOOK_INTO(g_orig_update, update_target, sizeof(update_prologue), (void *)&fmod_update_hook);
     }
     log_append(g_orig_update ? "SPOTIFY: FMOD update hook installed.\r\n"
                              : "SPOTIFY: FMOD update hook skipped (unexpected code); Spotify will not play.\r\n");
@@ -1336,7 +1376,7 @@ void spotify_bridge_apply_audio_hook(unsigned char *game_image) {
                                                         0x48, 0x81, 0xec, 0x60, 0x01, 0x00, 0x00};
     unsigned char *seek_target = game_image + RADIO_RVA(0x19acec0, 0x27c3ac0);
     if (memory_equal(seek_target, g_fh3 ? fh3_seek_prologue : seek_prologue, sizeof(seek_prologue))) {
-        g_orig_set_position = install_jmp_hook(seek_target, sizeof(seek_prologue), (void *)&set_position_hook);
+        HOOK_INTO(g_orig_set_position, seek_target, sizeof(seek_prologue), (void *)&set_position_hook);
     }
     log_append(g_orig_set_position ? "SPOTIFY: seek hook installed (Xbox Music plays past 600s).\r\n"
                                    : "SPOTIFY: seek hook skipped (unexpected code); Xbox Music restarts every 600s.\r\n");
@@ -1346,7 +1386,7 @@ void spotify_bridge_apply_audio_hook(unsigned char *game_image) {
                                                     0x57, 0x48, 0x81, 0xec, 0x68, 0x01, 0x00, 0x00};
     unsigned char *play_target = game_image + RADIO_RVA(0x199b0f0, 0x27bfa40);
     if (memory_equal(play_target, play_prologue, sizeof(play_prologue))) {
-        g_orig_playSound = (FmodPlaySoundFn)install_jmp_hook(play_target, sizeof(play_prologue), (void *)&spotify_radio_play_sound_hook);
+        HOOK_INTO(g_orig_playSound, play_target, sizeof(play_prologue), (void *)&spotify_radio_play_sound_hook);
     }
     log_append(g_orig_playSound ? "SPOTIFY: FMOD radio hook installed.\r\n"
                                 : "SPOTIFY: FMOD radio hook skipped (unexpected code); Spotify will not play.\r\n");
